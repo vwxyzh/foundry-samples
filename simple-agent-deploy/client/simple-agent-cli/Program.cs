@@ -35,57 +35,55 @@ using var httpClient = new HttpClient();
 httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token.Token);
 
 Console.WriteLine($"Sending to agent '{agentName}': {input}");
-var payload = JsonSerializer.Serialize(new { input, stream = false });
-using var content = new StringContent(payload, Encoding.UTF8, "application/json");
-using var response = await httpClient.PostAsync(responsesEndpoint, content);
-var responseBody = await response.Content.ReadAsStringAsync();
+var payload = JsonSerializer.Serialize(new { input, stream = true });
+
+var request = new HttpRequestMessage(HttpMethod.Post, responsesEndpoint);
+request.Content = new StringContent(payload, Encoding.UTF8, "application/json");
+request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token.Token);
+
+using var response = await httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
 
 if (!response.IsSuccessStatusCode)
 {
+	var errorBody = await response.Content.ReadAsStringAsync();
 	Console.Error.WriteLine($"Request failed with status {(int)response.StatusCode}: {response.ReasonPhrase}");
-	Console.Error.WriteLine(responseBody);
+	Console.Error.WriteLine(errorBody);
 	Environment.Exit(1);
 }
 
-var outputText = ExtractOutputText(responseBody);
 Console.WriteLine("Agent response:");
-Console.WriteLine(string.IsNullOrWhiteSpace(outputText) ? "<empty>" : outputText);
+using var stream = await response.Content.ReadAsStreamAsync();
+using var reader = new StreamReader(stream);
 
-static string? ExtractOutputText(string responseBody)
+while (!reader.EndOfStream)
 {
-	using var doc = JsonDocument.Parse(responseBody);
-	var root = doc.RootElement;
+	var line = await reader.ReadLineAsync();
+	if (line is null) break;
+	if (!line.StartsWith("data: ")) continue;
 
-	if (root.TryGetProperty("output_text", out var directText) && directText.ValueKind == JsonValueKind.String)
-	{
-		return directText.GetString();
-	}
+	var data = line["data: ".Length..];
+	if (data == "[DONE]") break;
 
-	if (root.TryGetProperty("output", out var output) && output.ValueKind == JsonValueKind.Array)
+	try
 	{
-		var sb = new StringBuilder();
-		foreach (var item in output.EnumerateArray())
+		using var doc = JsonDocument.Parse(data);
+		var root = doc.RootElement;
+
+		// Extract delta text from response.output_text.delta events
+		if (root.TryGetProperty("type", out var typeProp))
 		{
-			if (!item.TryGetProperty("content", out var contentArray) || contentArray.ValueKind != JsonValueKind.Array)
+			var type = typeProp.GetString();
+			if (type == "response.output_text.delta" &&
+				root.TryGetProperty("delta", out var delta) &&
+				delta.ValueKind == JsonValueKind.String)
 			{
-				continue;
-			}
-
-			foreach (var content in contentArray.EnumerateArray())
-			{
-				if (content.TryGetProperty("text", out var text) && text.ValueKind == JsonValueKind.String)
-				{
-					if (sb.Length > 0)
-					{
-						sb.AppendLine();
-					}
-					sb.Append(text.GetString());
-				}
+				Console.Write(delta.GetString());
 			}
 		}
-
-		return sb.ToString();
 	}
-
-	return null;
+	catch (JsonException)
+	{
+		// skip malformed events
+	}
 }
+Console.WriteLine();
